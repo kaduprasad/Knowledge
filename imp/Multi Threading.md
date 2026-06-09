@@ -511,56 +511,123 @@ public void increment() {
 
 ---
 
-## What is `CompletableFuture`?
+## What is `Future`?
 
-`CompletableFuture` is Java 8's powerful way to write **asynchronous, non-blocking** code. It supports chaining, combining, and error handling.
+- `Future` represents the **result of an async computation** that will be available *sometime in the future*.
+- You submit a task to `ExecutorService`, it returns a `Future` — you can check later if it's done or get the result.
+- **Problem:** `future.get()` is **blocking** — your thread just sits and waits. No chaining, no callbacks.
 
 ### Simple Example
 
 ```java
-import java.util.concurrent.CompletableFuture;
+ExecutorService executor = Executors.newSingleThreadExecutor();
 
-public class AsyncExample {
-    public static void main(String[] args) {
-        // Run async task
-        CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
-            // Simulating long task
-            try { Thread.sleep(1000); } catch (InterruptedException e) {}
-            return "Hello from async!";
-        });
+Future<String> future = executor.submit(() -> {
+    Thread.sleep(2000);
+    return "Result ready!";
+});
 
-        // Chain operations
-        future.thenApply(result -> result.toUpperCase())
-              .thenAccept(result -> System.out.println(result)); // HELLO FROM ASYNC!
+// Do other work here...
 
-        // Keep main thread alive
-        future.join();
-    }
-}
+String result = future.get(); // BLOCKS until result is available
+System.out.println(result);
+executor.shutdown();
+```
+
+### Limitations of `Future` (Why `CompletableFuture` was created)
+
+| Problem | Description |
+|---------|-------------|
+| **Blocking** | `get()` blocks the calling thread |
+| **No chaining** | Can't do "when done, do this next" |
+| **No combining** | Can't easily merge results of multiple futures |
+| **No exception handling** | No `exceptionally()` or fallback mechanism |
+| **Can't complete manually** | Once submitted, you can't set the result yourself |
+
+**Real-life analogy:** `Future` is like ordering food and **standing at the counter** until it's ready. `CompletableFuture` is like getting a **buzzer** — you go do other things and it notifies you.
+
+---
+
+## What is `CompletableFuture`?
+
+- It's an **upgrade over `Future`** — introduced in Java 8
+- With plain `Future`, you call `future.get()` which **blocks** the thread. No chaining, no callbacks.
+- `CompletableFuture` solves this — you can **chain tasks**, **combine results**, and **handle errors** without blocking.
+- Think of it as **Promises in JavaScript** but for Java.
+- Internally uses **ForkJoinPool** (common pool) for async execution.
+
+**When to use:** Calling multiple APIs in parallel, non-blocking I/O, async pipelines.
+
+### Real-Life Scenarios
+
+| Scenario | Why CompletableFuture? |
+|----------|----------------------|
+| REST API calling 3 microservices | Call all 3 in parallel, combine results — response time = max of 3, not sum |
+| E-commerce checkout | Validate payment + check inventory + apply coupon — all async |
+| Notification system | Send email + SMS + push notification — don't wait for each |
+| Report generation | Fetch data from multiple DBs in parallel, merge into one report |
+
+### Simple Example
+
+```java
+CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
+    // runs in ForkJoinPool (separate thread)
+    return "Hello from async!";
+});
+
+// Chain: transform result -> consume it
+future.thenApply(result -> result.toUpperCase())
+      .thenAccept(System.out::println); // HELLO FROM ASYNC!
+
+future.join(); // non-blocking wait (unlike Future.get(), doesn't throw checked exceptions)
 ```
 
 ### Combining Multiple Futures
 
 ```java
-CompletableFuture<Integer> future1 = CompletableFuture.supplyAsync(() -> 10);
-CompletableFuture<Integer> future2 = CompletableFuture.supplyAsync(() -> 20);
+CompletableFuture<Integer> f1 = CompletableFuture.supplyAsync(() -> 10);
+CompletableFuture<Integer> f2 = CompletableFuture.supplyAsync(() -> 20);
 
-// Combine results
-CompletableFuture<Integer> combined = future1.thenCombine(future2, (a, b) -> a + b);
-System.out.println(combined.get()); // 30
+f1.thenCombine(f2, (a, b) -> a + b)
+  .thenAccept(System.out::println); // 30
 ```
 
 ### Error Handling
 
 ```java
 CompletableFuture.supplyAsync(() -> {
-    if (true) throw new RuntimeException("Error!");
-    return "Success";
+    throw new RuntimeException("Something broke!");
 }).exceptionally(ex -> {
-    System.out.println("Exception: " + ex.getMessage());
-    return "Fallback value";
+    return "Fallback value"; // graceful recovery
 }).thenAccept(System.out::println); // Fallback value
 ```
+
+### Key Methods Cheat Sheet
+
+| Method | What it does |
+|--------|-------------|
+| `supplyAsync(() -> ...)` | Run task async, returns result |
+| `thenApply(fn)` | Transform result (like `.map()`) |
+| `thenAccept(fn)` | Consume result (no return) |
+| `thenCombine(other, fn)` | Combine 2 futures |
+| `allOf(f1, f2, f3)` | Wait for ALL to complete |
+| `anyOf(f1, f2, f3)` | Wait for FIRST to complete |
+| `exceptionally(fn)` | Handle errors with fallback |
+| `join()` | Block and get result (no checked exception) |
+
+### Tricky Follow-up Questions
+
+> **Q: What thread pool does `supplyAsync()` use by default?**
+> ForkJoinPool.commonPool(). You can pass a custom executor as 2nd argument.
+
+> **Q: Difference between `thenApply()` vs `thenApplyAsync()`?**
+> `thenApply()` runs on the **same thread** that completed the previous stage. `thenApplyAsync()` runs on a **different thread** from the pool.
+
+> **Q: What happens if you don't call `join()` or `get()`?**
+> The main thread may exit before the async task finishes. In a web server (Spring Boot), this isn't an issue because the server keeps running.
+
+> **Q: `Future.get()` vs `CompletableFuture.join()` ?**
+> `get()` throws **checked** `InterruptedException` + `ExecutionException`. `join()` throws **unchecked** `CompletionException`. Use `join()` in lambdas/streams.
 
 ---
 
@@ -568,81 +635,53 @@ CompletableFuture.supplyAsync(() -> {
 
 **Q: I have 1000 tasks but want to limit concurrent execution to 100 threads. How?**
 
+- The idea is simple: **don't create 1000 threads** — create a **pool of 100** and queue the rest.
+- The pool picks up new tasks as threads finish their current work.
+- This is a very common interview question for **backend/microservice roles**.
+
 ### Solution 1: `ExecutorService` with Fixed Thread Pool (Recommended)
 
 ```java
-import java.util.concurrent.*;
-
-public class ThreadLimitExample {
-    public static void main(String[] args) {
-        // Create a pool with MAX 100 threads
-        ExecutorService executor = Executors.newFixedThreadPool(100);
-
-        // Submit 1000 tasks - only 100 will run at a time!
-        for (int i = 0; i < 1000; i++) {
-            final int taskId = i;
-            executor.submit(() -> {
-                System.out.println("Task " + taskId + " running on " + Thread.currentThread().getName());
-                try { Thread.sleep(500); } catch (InterruptedException e) {}
-            });
-        }
-
-        executor.shutdown();
-        try {
-            executor.awaitTermination(1, TimeUnit.HOURS);
-        } catch (InterruptedException e) {}
-        System.out.println("All 1000 tasks completed!");
-    }
-}
-```
-
-### Solution 2: Using `Semaphore`
-
-```java
-import java.util.concurrent.*;
-
-public class SemaphoreExample {
-    private static final Semaphore semaphore = new Semaphore(100); // Max 100 concurrent
-
-    public static void main(String[] args) {
-        ExecutorService executor = Executors.newCachedThreadPool();
-
-        for (int i = 0; i < 1000; i++) {
-            final int taskId = i;
-            executor.submit(() -> {
-                try {
-                    semaphore.acquire(); // Will block if 100 threads already running
-                    System.out.println("Task " + taskId + " executing...");
-                    Thread.sleep(500);
-                } catch (InterruptedException e) {
-                } finally {
-                    semaphore.release(); // Release permit for next task
-                }
-            });
-        }
-
-        executor.shutdown();
-    }
-}
-```
-
-### Solution 3: Using `ThreadPoolExecutor` (Custom Control)
-
-```java
-ThreadPoolExecutor executor = new ThreadPoolExecutor(
-    100,                          // core pool size
-    100,                          // max pool size
-    60L, TimeUnit.SECONDS,        // keep-alive time
-    new LinkedBlockingQueue<>(900) // queue capacity for remaining 900 tasks
-);
+ExecutorService executor = Executors.newFixedThreadPool(100); // only 100 threads
 
 for (int i = 0; i < 1000; i++) {
     final int taskId = i;
-    executor.execute(() -> {
+    executor.submit(() -> {
         System.out.println("Task " + taskId + " on " + Thread.currentThread().getName());
     });
 }
+
 executor.shutdown();
+executor.awaitTermination(1, TimeUnit.HOURS);
+```
+
+### Solution 2: Using `Semaphore` (When you need finer control)
+
+```java
+Semaphore semaphore = new Semaphore(100); // max 100 concurrent
+ExecutorService executor = Executors.newCachedThreadPool();
+
+for (int i = 0; i < 1000; i++) {
+    executor.submit(() -> {
+        semaphore.acquire();  // blocks if 100 already running
+        try {
+            // do task
+        } finally {
+            semaphore.release(); // free permit for next task
+        }
+    });
+}
+executor.shutdown();
+```
+
+### Solution 3: `ThreadPoolExecutor` (Custom control)
+
+```java
+ThreadPoolExecutor executor = new ThreadPoolExecutor(
+    100, 100,                      // core & max pool size
+    60L, TimeUnit.SECONDS,         // idle thread keep-alive
+    new LinkedBlockingQueue<>(900) // queue for remaining tasks
+);
 ```
 
 | Approach | Best When |
@@ -651,65 +690,97 @@ executor.shutdown();
 | `Semaphore` | Need to limit concurrency in specific code sections |
 | `ThreadPoolExecutor` | Need fine-grained control (queue size, rejection policy) |
 
+### Tricky Follow-up Questions
+
+> **Q: What happens when the queue is full in `ThreadPoolExecutor`?**
+> It uses a **RejectedExecutionHandler**. Default is `AbortPolicy` (throws exception). Others: `CallerRunsPolicy` (caller thread runs the task), `DiscardPolicy`, `DiscardOldestPolicy`.
+
+> **Q: `FixedThreadPool` vs `CachedThreadPool` — when to use which?**
+> Fixed = predictable load, bounded resources. Cached = short-lived burst tasks, but **dangerous** — can create unlimited threads and crash with OOM.
+
+> **Q: What if a task throws an exception inside the pool?**
+> The thread dies silently (with `execute()`). Use `submit()` + `future.get()` to catch exceptions. Or set an `UncaughtExceptionHandler`.
+
 ---
 
 ## Tricky Interview Questions (Real-Life Scenarios)
 
+> **Tip:** In interviews, don't just name the class — explain **why** that solution fits. Interviewers want to see your thought process.
+
 ### Q1: How would you design a thread-safe counter for a high-traffic web application?
 
-**Answer:** Use `AtomicLong` or `LongAdder` (better for high contention):
+**Answer:**
+- `synchronized` works but is **slow under high contention** (threads keep waiting).
+- `AtomicLong` is better — uses **CAS (Compare-And-Swap)**, no locks.
+- For **very high contention** (millions of requests), use `LongAdder` — it splits the counter into cells and sums them on read.
+
 ```java
-// AtomicLong - good for moderate contention
+// Good
 private AtomicLong counter = new AtomicLong(0);
 counter.incrementAndGet();
 
-// LongAdder - better for HIGH contention (uses striped cells)
+// Best for HIGH contention
 private LongAdder counter = new LongAdder();
 counter.increment();
-long value = counter.sum();
 ```
+
+> **Follow-up: Why not just use `synchronized`?** Every thread has to wait in line. With `AtomicLong`, threads retry using CAS — no blocking. `LongAdder` is even better because each thread writes to its own cell, reducing contention to near-zero.
 
 ### Q2: Two threads are reading from a database and writing to a cache. How do you ensure the cache is updated atomically?
 
-**Answer:** Use `ReadWriteLock` - allow multiple readers but exclusive writer:
+**Answer:**
+- If you use `synchronized`, readers also get blocked — bad for performance.
+- Use `ReadWriteLock` — **multiple readers can read simultaneously**, but writer gets **exclusive access**.
+- This is the go-to pattern for **caching scenarios**.
+
 ```java
-ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
 
-// Read from cache
-lock.readLock().lock();
+// Reading (multiple threads can do this together)
+rwLock.readLock().lock();
 try { return cache.get(key); }
-finally { lock.readLock().unlock(); }
+finally { rwLock.readLock().unlock(); }
 
-// Write to cache
-lock.writeLock().lock();
+// Writing (exclusive - blocks all readers)
+rwLock.writeLock().lock();
 try { cache.put(key, value); }
-finally { lock.writeLock().unlock(); }
+finally { rwLock.writeLock().unlock(); }
 ```
+
+> **Follow-up: Can a reader upgrade to writer?** No! If a reader tries to acquire write lock while holding read lock → **deadlock**. You must release read lock first, then acquire write lock.
 
 ### Q3: You have a REST API that calls 3 external services. How do you call them in parallel and combine results?
 
-**Answer:** Use `CompletableFuture`:
+**Answer:**
+- Sequential calls = total time is **sum** of all three. Parallel = total time is **max** of the three.
+- Use `CompletableFuture.supplyAsync()` for each call, then `allOf().join()` to wait.
+
 ```java
-CompletableFuture<User> userFuture = CompletableFuture.supplyAsync(() -> userService.getUser(id));
-CompletableFuture<List<Order>> ordersFuture = CompletableFuture.supplyAsync(() -> orderService.getOrders(id));
-CompletableFuture<Address> addressFuture = CompletableFuture.supplyAsync(() -> addressService.getAddress(id));
+CompletableFuture<User> userF = CompletableFuture.supplyAsync(() -> userService.get(id));
+CompletableFuture<List<Order>> ordersF = CompletableFuture.supplyAsync(() -> orderService.get(id));
+CompletableFuture<Address> addressF = CompletableFuture.supplyAsync(() -> addressService.get(id));
 
-// Wait for all and combine
-CompletableFuture.allOf(userFuture, ordersFuture, addressFuture).join();
+CompletableFuture.allOf(userF, ordersF, addressF).join(); // wait for all
 
-UserProfile profile = new UserProfile(userFuture.get(), ordersFuture.get(), addressFuture.get());
+return new UserProfile(userF.get(), ordersF.get(), addressF.get());
 ```
+
+> **Follow-up: What if one service fails?** Use `handle()` or `exceptionally()` on each future to return a default value. Don't let one failure kill the whole response.
 
 ### Q4: A singleton is being created by multiple threads simultaneously. How do you ensure only ONE instance?
 
-**Answer:** Double-checked locking with `volatile`:
+**Answer:**
+- Simple `synchronized` on the whole method works but is **slow** (lock acquired every time).
+- **Double-checked locking** — only synchronizes on first creation.
+- `volatile` is critical here — without it, a thread might see a **partially constructed** object.
+
 ```java
 private static volatile Singleton instance;
 
 public static Singleton getInstance() {
-    if (instance == null) {
+    if (instance == null) {                  // 1st check - no lock
         synchronized (Singleton.class) {
-            if (instance == null) {
+            if (instance == null) {           // 2nd check - inside lock
                 instance = new Singleton();
             }
         }
@@ -718,101 +789,128 @@ public static Singleton getInstance() {
 }
 ```
 
+> **Follow-up: Why do we need `volatile` here?** Without it, `instance = new Singleton()` can be reordered by JVM — another thread might see a non-null reference to an **incompletely constructed** object.
+
+> **Follow-up: Easier alternative?** Use **enum singleton** (`enum Singleton { INSTANCE; }`) — JVM guarantees single instance, thread-safe, serialization-safe.
+
 ### Q5: You're processing 10,000 orders. If one fails, you don't want to stop others. How do you handle this?
 
-**Answer:** Submit tasks individually, collect `Future`s, handle exceptions per task:
+**Answer:**
+- Key insight: **isolate failures**. Each task runs independently.
+- Submit all tasks, collect `Future`s, handle exceptions **per task** in a loop.
+- Never let one `ExecutionException` kill your entire batch.
+
 ```java
 ExecutorService executor = Executors.newFixedThreadPool(50);
-List<Future<OrderResult>> futures = new ArrayList<>();
+List<Future<Result>> futures = new ArrayList<>();
 
 for (Order order : orders) {
-    futures.add(executor.submit(() -> processOrder(order)));
+    futures.add(executor.submit(() -> process(order)));
 }
 
-for (Future<OrderResult> future : futures) {
+for (Future<Result> f : futures) {
     try {
-        OrderResult result = future.get();
-        // handle success
+        Result r = f.get(); // handle success
     } catch (ExecutionException e) {
-        log.error("Order failed: " + e.getCause().getMessage());
-        // handle failure - don't stop others!
+        log.error("Failed: " + e.getCause().getMessage());
+        // continue — don't break!
     }
 }
 executor.shutdown();
 ```
 
+> **Follow-up: What if you want to retry failed orders?** Collect failed orders in a separate list, then resubmit them with a delay (exponential backoff). Or use `CompletableFuture` with `.exceptionally()` that retries.
+
 ### Q6: How would you implement a rate limiter that allows max 100 requests per second?
 
-**Answer:** Use `Semaphore` with a scheduled reset:
+**Answer:**
+- `Semaphore` with 100 permits — each request acquires one, a scheduled task resets them every second.
+- In production, prefer libraries like **Guava's RateLimiter** or **Resilience4j**.
+- Key: `tryAcquire()` (non-blocking) vs `acquire()` (blocking).
+
 ```java
 class RateLimiter {
     private final Semaphore semaphore = new Semaphore(100);
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
 
     public RateLimiter() {
-        // Reset permits every second
         scheduler.scheduleAtFixedRate(() -> {
-            int permitsToRelease = 100 - semaphore.availablePermits();
-            semaphore.release(permitsToRelease);
+            semaphore.release(100 - semaphore.availablePermits());
         }, 1, 1, TimeUnit.SECONDS);
     }
 
-    public boolean tryAcquire() {
+    public boolean allowRequest() {
         return semaphore.tryAcquire();
     }
 }
 ```
 
+> **Follow-up: What's the difference between rate limiting and throttling?** Rate limiting = hard cap (reject excess). Throttling = slow down (queue/delay excess). Both protect the system but behave differently for the client.
+
 ### Q7: Thread A must wait for Thread B and Thread C to finish before proceeding. How?
 
-**Answer:** Use `CountDownLatch`:
+**Answer:**
+- `CountDownLatch(2)` — each thread counts down on finish. A calls `await()` and blocks until count = 0.
+- Alternative: `CompletableFuture.allOf()` if you're already using CompletableFuture.
+- **Don't confuse with `CyclicBarrier`** — that's for threads waiting for *each other* (reusable).
+
 ```java
-CountDownLatch latch = new CountDownLatch(2); // Wait for 2 threads
+CountDownLatch latch = new CountDownLatch(2);
 
-new Thread(() -> { doWork(); latch.countDown(); }).start(); // Thread B
-new Thread(() -> { doWork(); latch.countDown(); }).start(); // Thread C
+new Thread(() -> { doWork(); latch.countDown(); }).start(); // B
+new Thread(() -> { doWork(); latch.countDown(); }).start(); // C
 
-latch.await(); // Thread A waits here until count reaches 0
-System.out.println("Both B and C finished. A proceeds.");
+latch.await(); // A waits here until count = 0
 ```
+
+> **Follow-up: `CountDownLatch` vs `CyclicBarrier`?**
+> - `CountDownLatch` = one-shot, count goes down, can't reset.
+> - `CyclicBarrier` = reusable, all threads wait for each other at a barrier point (like gaming lobbies waiting for all players).
 
 ### Q8: How do you detect and resolve a deadlock in production?
 
 **Answer:**
-1. **Detect:** Use `jstack <pid>` or `ThreadMXBean`:
+1. **Detect:** `jstack <pid>` (CLI) or programmatically:
 ```java
-ThreadMXBean bean = ManagementFactory.getThreadMXBean();
-long[] deadlockedThreads = bean.findDeadlockedThreads();
+long[] ids = ManagementFactory.getThreadMXBean().findDeadlockedThreads();
 ```
-2. **Resolve:** Restart the affected threads or the application.
-3. **Prevent:** Use lock ordering, `tryLock()` with timeout, avoid nested locks.
+2. **Resolve:** Restart affected threads or the app.
+3. **Prevent:** Lock ordering, `tryLock()` with timeout, avoid nested locks.
+
+> **Follow-up: Can JVM resolve deadlocks automatically?** No. Unlike databases (which can detect and kill one transaction), JVM deadlocks are permanent unless you restart or the threads are interrupted externally.
 
 ### Q9: How do you make a HashMap thread-safe?
 
 **Answer:**
+- **`ConcurrentHashMap`** (best) — segment-level locking, concurrent reads + writes.
+- `Collections.synchronizedMap()` — wraps with single lock, slower.
+- Key interview point: `ConcurrentHashMap` **does NOT allow null keys/values** (unlike HashMap).
+
 ```java
-// Option 1: ConcurrentHashMap (best for concurrent access)
-Map<String, String> map = new ConcurrentHashMap<>();
-
-// Option 2: Collections.synchronizedMap (wraps with synchronized)
-Map<String, String> map = Collections.synchronizedMap(new HashMap<>());
-
-// Option 3: Manually synchronize (least preferred)
-synchronized (map) { map.put(key, value); }
+Map<String, String> map = new ConcurrentHashMap<>();  // Best
+Map<String, String> map2 = Collections.synchronizedMap(new HashMap<>());  // OK
 ```
 
-> **Prefer `ConcurrentHashMap`** - it uses segment-level locking (Java 7) or CAS + synchronized (Java 8+), allowing concurrent reads and writes.
+> **Follow-up: Why doesn't `ConcurrentHashMap` allow null?** Because `map.get(key)` returning `null` would be ambiguous — is the key absent, or is the value actually null? In concurrent code, you can't use `containsKey()` + `get()` atomically.
+
+> **Follow-up: Is `ConcurrentHashMap.size()` accurate?** No! It's an **estimate** in concurrent scenarios. Use it for monitoring, not for logic.
 
 ### Q10: What happens if you call `run()` instead of `start()` on a thread?
 
-**Answer:** Calling `run()` directly executes it in the **current thread** (no new thread created). Only `start()` creates a new thread and calls `run()` in that new thread.
+**Answer:**
+- `run()` = just a **normal method call** on the current thread. No new thread created.
+- `start()` = JVM creates a **new OS thread**, then calls `run()` inside it.
+- This is a classic **trick question** — interviewers want to see if you know the difference.
 
 ```java
 Thread t = new Thread(() -> System.out.println(Thread.currentThread().getName()));
-
-t.run();   // Output: main (runs in current thread!)
-t.start(); // Output: Thread-0 (runs in new thread)
+t.run();   // prints: main (same thread!)
+t.start(); // prints: Thread-0 (new thread)
 ```
+
+> **Follow-up: Can you call `start()` twice on the same thread?** No! Throws `IllegalThreadStateException`. Once a thread is TERMINATED, it cannot be restarted. You must create a new `Thread` object.
+
+> **Follow-up: What happens if you call `start()` after `run()`?** It still works — `run()` was just a regular method call, it didn't change the thread's state. But calling `start()` twice throws an exception.
 
 ---
 
