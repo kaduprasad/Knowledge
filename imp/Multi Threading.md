@@ -914,6 +914,454 @@ t.start(); // prints: Thread-0 (new thread)
 
 ---
 
+## Senior-Level Interview Questions
+
+### Q: Did you write any multi-threaded code? Have you faced any concurrency bug and how did you find and fix it?
+
+**Answer (Senior Dev Perspective):**
+
+Yes — in almost every production backend you'll encounter concurrency bugs. Here's a real-world pattern:
+
+**Scenario:** We had a shared in-memory cache (a `HashMap`) being accessed by multiple request-handling threads. Intermittently, the application would enter an infinite loop (CPU spike to 100%) or return corrupted data.
+
+**How I found it:**
+1. **Thread dump (`jstack`)** — Showed multiple threads stuck in `HashMap.get()` and `HashMap.put()`. This is the classic symptom of concurrent modification on a non-thread-safe `HashMap` (internal table resize causes linked-list corruption → infinite loop).
+2. **Code review** — Confirmed no synchronization around the shared `HashMap`.
+
+**How I fixed it:**
+- Replaced `HashMap` with `ConcurrentHashMap` — this solved the race condition without introducing a global lock.
+- Added unit tests using `CountDownLatch` to force concurrent access and reproduce the bug deterministically.
+- Set up a `CyclicBarrier` in tests to make all threads hit the critical section simultaneously.
+
+**Key lessons:**
+- Race conditions are **non-deterministic** — they don't fail every time, which makes them hard to catch in dev/QA.
+- Always use **thread-safe collections** (`ConcurrentHashMap`, `CopyOnWriteArrayList`) for shared state.
+- **Thread dumps are your best friend** — learn `jstack`, VisualVM, or async-profiler.
+- Use tools like **FindBugs/SpotBugs** or **IntelliJ's concurrency inspections** to detect unsafe sharing statically.
+
+---
+
+### Q: In a Spring Boot application, how would you configure an async task executor with `@Async` annotation, and what happens if you do not configure a custom task executor?
+
+**Answer:**
+
+**Default behavior (no custom executor):**
+- Spring Boot uses `SimpleAsyncTaskExecutor` by default — it creates a **new thread for every task** (no thread reuse, no queue, no pool).
+- This is **dangerous in production** — under load, it can spawn thousands of threads and cause `OutOfMemoryError`.
+
+**How to configure a custom executor:**
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+    @Bean(name = "taskExecutor")
+    public Executor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);       // min threads always alive
+        executor.setMaxPoolSize(50);        // max threads under load
+        executor.setQueueCapacity(100);     // queue before scaling up
+        executor.setThreadNamePrefix("Async-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+**Usage:**
+```java
+@Service
+public class NotificationService {
+
+    @Async("taskExecutor")  // specify which executor
+    public CompletableFuture<String> sendEmail(String to) {
+        // long-running task
+        return CompletableFuture.completedFuture("Sent to " + to);
+    }
+}
+```
+
+**Key points:**
+- Always name your executor and reference it in `@Async("name")` — otherwise Spring picks the default.
+- `@EnableAsync` is **required** on a `@Configuration` class.
+- The `@Async` method must be `public` and called from **outside the class** (due to proxy-based AOP — self-invocation won't work).
+- Return type should be `void` or `CompletableFuture<T>` / `Future<T>` — otherwise caller can't track completion or exceptions.
+- **Exception handling:** Unhandled exceptions in `@Async void` methods are silently swallowed unless you configure an `AsyncUncaughtExceptionHandler`.
+
+> **Follow-up: What happens if `@Async` is on a private method?** It won't work. Spring AOP proxies only intercept public methods called externally.
+
+> **Follow-up: CallerRunsPolicy vs AbortPolicy?** `CallerRunsPolicy` makes the calling thread execute the task (provides backpressure). `AbortPolicy` throws `RejectedExecutionException`.
+
+---
+
+### Q: How would you run two async tasks in parallel and combine their results when both complete?
+
+**Answer:**
+
+Use `CompletableFuture.supplyAsync()` for each task, then `thenCombine()` to merge results:
+
+```java
+CompletableFuture<UserProfile> userFuture = CompletableFuture.supplyAsync(
+    () -> userService.fetchProfile(userId), executor
+);
+
+CompletableFuture<List<Order>> orderFuture = CompletableFuture.supplyAsync(
+    () -> orderService.fetchOrders(userId), executor
+);
+
+// Combine when BOTH complete
+CompletableFuture<UserDashboard> combined = userFuture.thenCombine(orderFuture,
+    (profile, orders) -> new UserDashboard(profile, orders)
+);
+
+UserDashboard dashboard = combined.join(); // blocks until both done
+```
+
+**Alternative: Using `allOf()` (for 2+ futures):**
+
+```java
+CompletableFuture.allOf(userFuture, orderFuture).join();
+
+// Both are guaranteed complete here
+UserProfile profile = userFuture.join();
+List<Order> orders = orderFuture.join();
+```
+
+**Key points:**
+- **`thenCombine()`** — best for exactly 2 futures, gives you both results in the BiFunction.
+- **`allOf().join()`** — best for 3+ futures, but returns `Void` so you must call `.join()` on each individually after.
+- Always pass a **custom executor** — don't rely on `ForkJoinPool.commonPool()` in production (shared by all, limited threads = common pool size equals CPU cores - 1).
+- **Error handling:** Use `.exceptionally()` or `.handle()` on individual futures so one failure doesn't crash the whole pipeline.
+
+> **Follow-up: What's the total execution time?** `max(task1Time, task2Time)` — not the sum. That's the whole point of parallel execution.
+
+> **Follow-up: What if one task fails?** With `thenCombine`, the combined future completes exceptionally. Use `handle()` to provide a fallback per task.
+
+---
+
+### Q: What's the difference between synchronized method and synchronized block, and when would you choose one over the other?
+
+**Answer:**
+
+| Aspect | Synchronized Method | Synchronized Block |
+|--------|--------------------|--------------------|
+| **Lock object** | `this` (instance method) or `Class.class` (static method) | Any object you specify |
+| **Scope** | Entire method body | Only the critical section |
+| **Granularity** | Coarse — locks more than needed | Fine — lock only what's necessary |
+| **Flexibility** | Limited | Can use different lock objects |
+| **Readability** | Simpler for short methods | Better for complex methods |
+
+**Synchronized Method:**
+```java
+public synchronized void transfer(Account to, int amount) {
+    this.balance -= amount;   // entire method is locked
+    to.balance += amount;     // still holds lock on 'this', but NOT on 'to'!
+}
+```
+
+**Synchronized Block:**
+```java
+public void transfer(Account to, int amount) {
+    // Only lock what's needed, and can lock MULTIPLE objects
+    synchronized (this) {
+        this.balance -= amount;
+    }
+    synchronized (to) {
+        to.balance += amount;
+    }
+}
+```
+
+**When to choose:**
+- **Synchronized method** — Simple cases where the entire method is the critical section (e.g., simple getters/setters on shared state).
+- **Synchronized block** — When you need to:
+  - Lock on a **specific object** (not `this`) — e.g., a private `final Object lock = new Object();`
+  - **Minimize lock scope** — hold the lock for the shortest time possible to maximize concurrency.
+  - Lock on **multiple objects** (carefully, with consistent ordering to avoid deadlock).
+
+> **Follow-up: Why use a private lock object instead of `this`?** Because external code can also synchronize on your object (`synchronized(yourObj)`), causing unexpected contention or deadlock. A private lock is encapsulated.
+
+> **Follow-up: Performance impact?** Synchronized methods hold the lock for the entire method duration, including non-critical code. Synchronized blocks allow other threads to proceed through non-critical sections concurrently.
+
+---
+
+### Q: Suppose you have a method that throws a checked exception but the interface it implements does not declare that exception. How would you handle this situation?
+
+**Answer:**
+
+This is a common design challenge. Here are the approaches (ranked by preference):
+
+**1. Wrap in an unchecked exception (Most Common):**
+```java
+public interface DataProcessor {
+    void process(String data);
+}
+
+public class FileProcessor implements DataProcessor {
+    @Override
+    public void process(String data) {
+        try {
+            Files.write(Path.of("output.txt"), data.getBytes()); // throws IOException
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to write file", e); // wrap in unchecked
+        }
+    }
+}
+```
+
+**2. Use a custom unchecked exception:**
+```java
+public class ProcessingException extends RuntimeException {
+    public ProcessingException(String message, Throwable cause) {
+        super(message, cause);
+    }
+}
+
+// In implementation:
+catch (SQLException e) {
+    throw new ProcessingException("DB operation failed", e);
+}
+```
+
+**3. Sneaky throws (discouraged but exists):**
+```java
+@SuppressWarnings("unchecked")
+private static <E extends Throwable> void sneakyThrow(Throwable e) throws E {
+    throw (E) e;
+}
+```
+- Lombok's `@SneakyThrows` does this — but it breaks the contract and surprises callers.
+
+**Best practice:**
+- **Always preserve the original exception** as the `cause` (exception chaining).
+- The wrapping exception should be **meaningful** — not just `RuntimeException("error")`.
+- Document the possible runtime exceptions in Javadoc since they're not in the method signature.
+- If the interface is yours, consider redesigning it to declare the exception or use a generic `throws Exception`.
+
+> **Follow-up: Why not just declare `throws Exception` on the interface?** Because it forces ALL callers to handle it — even implementations that don't throw. It's lazy API design.
+
+---
+
+### Q: Have you ever created a custom exception hierarchy?
+
+**Answer:**
+
+Yes — in any well-designed enterprise application, a custom exception hierarchy is essential for clean error handling.
+
+**Typical structure:**
+
+```java
+// Base application exception (unchecked)
+public abstract class ApplicationException extends RuntimeException {
+    private final ErrorCode errorCode;
+    private final HttpStatus httpStatus;
+
+    protected ApplicationException(String message, ErrorCode code, HttpStatus status) {
+        super(message);
+        this.errorCode = code;
+        this.httpStatus = status;
+    }
+
+    protected ApplicationException(String message, Throwable cause, ErrorCode code, HttpStatus status) {
+        super(message, cause);
+        this.errorCode = code;
+        this.httpStatus = status;
+    }
+
+    public ErrorCode getErrorCode() { return errorCode; }
+    public HttpStatus getHttpStatus() { return httpStatus; }
+}
+
+// Specific exceptions
+public class ResourceNotFoundException extends ApplicationException {
+    public ResourceNotFoundException(String resource, Long id) {
+        super(resource + " not found with id: " + id,
+              ErrorCode.RESOURCE_NOT_FOUND, HttpStatus.NOT_FOUND);
+    }
+}
+
+public class BusinessRuleViolationException extends ApplicationException {
+    public BusinessRuleViolationException(String rule) {
+        super("Business rule violated: " + rule,
+              ErrorCode.BUSINESS_RULE_VIOLATION, HttpStatus.UNPROCESSABLE_ENTITY);
+    }
+}
+
+public class ExternalServiceException extends ApplicationException {
+    public ExternalServiceException(String service, Throwable cause) {
+        super("External service failed: " + service, cause,
+              ErrorCode.EXTERNAL_SERVICE_FAILURE, HttpStatus.SERVICE_UNAVAILABLE);
+    }
+}
+```
+
+**Usage with `@ControllerAdvice`:**
+```java
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ApplicationException.class)
+    public ResponseEntity<ErrorResponse> handleApplicationException(ApplicationException ex) {
+        ErrorResponse response = new ErrorResponse(ex.getErrorCode(), ex.getMessage());
+        return ResponseEntity.status(ex.getHttpStatus()).body(response);
+    }
+}
+```
+
+**Key design principles:**
+- **Unchecked (extends RuntimeException)** — avoids polluting every method signature with `throws`.
+- **Carry metadata** — error codes, HTTP status, context — so the handler can produce proper API responses.
+- **Hierarchical** — a single `@ExceptionHandler(ApplicationException.class)` catches them all, but you can also handle specific ones differently.
+- **Never expose internal details** to the client (stack traces, SQL errors) — log internally, return sanitized messages.
+
+---
+
+### Q: What is exception chaining and why is it very important in our projects?
+
+**Answer:**
+
+**Exception chaining** is the practice of wrapping a caught exception as the `cause` of a new exception, preserving the full error trail.
+
+```java
+try {
+    resultSet = statement.executeQuery(sql);
+} catch (SQLException e) {
+    // Chain: original exception is preserved as 'cause'
+    throw new DataAccessException("Failed to execute query: " + sql, e);
+}
+```
+
+**Why it's critically important:**
+
+1. **Root cause traceability** — In production, the exception you see at the top level (e.g., `ServiceException`) is generic. Without chaining, you lose the **actual root cause** (e.g., `SQLSyntaxErrorException: Unknown column 'xyz'`). Debugging becomes a nightmare.
+
+2. **Clean stack traces** — When you chain, `exception.getCause()` gives you the full trail:
+   ```
+   ServiceException: Order creation failed
+     caused by: DataAccessException: Failed to execute query
+       caused by: SQLException: Connection refused
+   ```
+
+3. **Layer separation** — Each layer wraps exceptions in its own type:
+   - **DAO layer** catches `SQLException` → throws `DataAccessException`
+   - **Service layer** catches `DataAccessException` → throws `ServiceException`
+   - **Controller layer** catches `ServiceException` → returns proper HTTP error
+
+4. **Never swallow exceptions:**
+   ```java
+   // TERRIBLE — original error is LOST forever
+   catch (IOException e) {
+       throw new RuntimeException("Something failed"); // WHERE? WHY? No one knows.
+   }
+
+   // CORRECT — full context preserved
+   catch (IOException e) {
+       throw new RuntimeException("Failed to read config file: " + filePath, e);
+   }
+   ```
+
+**Anti-patterns to avoid:**
+- `catch (Exception e) { e.printStackTrace(); }` — logs to stdout, no one sees it in production.
+- `catch (Exception e) { return null; }` — hides the failure, causes `NullPointerException` elsewhere.
+- `throw new RuntimeException(e.getMessage())` — loses the stack trace and cause chain.
+
+> **Follow-up: How do you access the full chain?** `Throwable.getCause()` recursively, or just log the exception — most logging frameworks (SLF4J/Logback) print the entire chain automatically.
+
+---
+
+### Q: What is the difference between heap memory and stack memory?
+
+**Answer:**
+
+| Aspect | Stack Memory | Heap Memory |
+|--------|-------------|-------------|
+| **Stores** | Method frames, local variables, references | Objects, instance variables |
+| **Scope** | Thread-private (each thread has its own stack) | Shared across all threads |
+| **Lifetime** | Freed when method returns (LIFO) | Freed by Garbage Collector |
+| **Size** | Small (default ~512KB–1MB per thread) | Large (configured via `-Xmx`) |
+| **Speed** | Very fast (pointer push/pop) | Slower (GC overhead, allocation) |
+| **Error** | `StackOverflowError` (deep recursion) | `OutOfMemoryError` (too many objects) |
+| **Thread safety** | Inherently thread-safe (private) | Requires synchronization |
+
+**Visual example:**
+
+```java
+public void processOrder(Order order) {   // 'order' reference → stack
+    int quantity = order.getQuantity();    // 'quantity' (primitive) → stack
+    String name = order.getName();         // 'name' reference → stack, String object → heap
+
+    List<Item> items = new ArrayList<>();  // 'items' reference → stack, ArrayList object → heap
+    items.add(new Item("Laptop"));         // Item object → heap
+}
+// When method returns: stack frame is popped, all local references gone
+// Heap objects become eligible for GC if no other references exist
+```
+
+**Key interview points:**
+- **Primitives** (`int`, `boolean`, `double`) stored on **stack** (as local variables) — not on heap.
+- **Objects** always live on the **heap** — the stack only holds the *reference* (pointer) to them.
+- **Static variables** are stored in the **Metaspace** (not heap, not stack) — part of the class metadata.
+- **Thread safety:** Stack is automatically thread-safe because it's private. Heap objects shared between threads need synchronization.
+
+> **Follow-up: Can you control stack size?** Yes — `-Xss` JVM flag (e.g., `-Xss512k`). Increase it if you have deep recursion. But more stack per thread = fewer threads possible (memory limit).
+
+> **Follow-up: Where are String literals stored?** In the **String Pool** (part of the heap since Java 7). `new String("abc")` creates an object on the heap regardless of the pool.
+
+---
+
+### Q: Have you ever faced `OutOfMemoryError` in production? How did you diagnose and fix it?
+
+**Answer:**
+
+Yes — this is one of the most common production issues in Java applications. Here's a real-world experience:
+
+**Scenario:** A Spring Boot microservice started throwing `java.lang.OutOfMemoryError: Java heap space` after running fine for days (memory leak — slow accumulation).
+
+**How I diagnosed:**
+
+1. **Enabled heap dump on OOM:**
+   ```
+   -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/logs/heapdump.hprof
+   ```
+
+2. **Analyzed heap dump with Eclipse MAT (Memory Analyzer Tool):**
+   - Found a `HashMap` holding 2 million `Session` objects.
+   - These were HTTP session objects being cached but **never evicted** — a classic memory leak.
+
+3. **Root cause:** A custom caching layer was storing user session data with no TTL (time-to-live) and no size limit. Over days, it grew unbounded.
+
+**How I fixed it:**
+- Replaced the raw `HashMap` with a **Caffeine cache** with `maximumSize(10_000)` and `expireAfterAccess(30, TimeUnit.MINUTES)`.
+- Added monitoring: exposed cache size via Micrometer metrics → Grafana dashboard.
+- Set proper JVM flags: `-Xmx2g -Xms2g` (set min = max to avoid resize pauses).
+
+**Common causes of OOM in production:**
+
+| Cause | Symptom | Fix |
+|-------|---------|-----|
+| Unbounded cache/collection | Heap grows linearly over time | Use bounded caches (Caffeine, Guava) with eviction |
+| Connection/resource leaks | Open connections pile up | Always use try-with-resources |
+| Large query results loaded in memory | Spike after specific operation | Use pagination, streaming (`Stream<T>`), or cursors |
+| Too many threads | `OOM: unable to create new native thread` | Use thread pools, limit concurrency |
+| Classloader leaks (redeployments) | Metaspace OOM | Fix static references, restart cleanly |
+
+**JVM flags every senior dev should know:**
+```
+-Xmx4g                              # Max heap
+-Xms4g                              # Initial heap (set = Xmx to avoid resizing)
+-XX:+HeapDumpOnOutOfMemoryError      # Auto dump on OOM
+-XX:+UseG1GC                         # Modern GC (default since Java 9)
+-XX:MaxMetaspaceSize=512m            # Cap metaspace
+```
+
+> **Follow-up: Difference between heap OOM and Metaspace OOM?** Heap OOM = too many objects. Metaspace OOM = too many loaded classes (common with heavy reflection, dynamic proxies, or classloader leaks).
+
+> **Follow-up: How do you prevent OOM proactively?** Monitor heap usage (Prometheus + Grafana), set alerts at 80% utilization, use bounded data structures, load-test with realistic data volumes.
+
+---
+
 [image1]: <data:image/png;base64,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>
 
 [image2]: <data:image/png;base64,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>
